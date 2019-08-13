@@ -289,6 +289,10 @@ struct bpf_map_def {
 	unsigned int value_size;
 	unsigned int max_entries;
 	unsigned int map_flags;
+	unsigned int map_id;
+	unsigned int pinning;
+	unsigned int inner_id;
+	unsigned int inner_idx;
 };
 
 /*
