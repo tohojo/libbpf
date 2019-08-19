@@ -67,6 +67,11 @@ struct bpf_object_open_attr {
 	enum bpf_prog_type prog_type;
 };
 
+enum bpf_pin_mode {
+	BPF_PIN_MODE_ALL = 0,
+	BPF_PIN_MODE_EXPLICIT,
+};
+
 LIBBPF_API struct bpf_object *bpf_object__open(const char *path);
 LIBBPF_API struct bpf_object *
 bpf_object__open_xattr(struct bpf_object_open_attr *attr);
@@ -79,6 +84,8 @@ int bpf_object__section_size(const struct bpf_object *obj, const char *name,
 			     __u32 *size);
 int bpf_object__variable_offset(const struct bpf_object *obj, const char *name,
 				__u32 *off);
+LIBBPF_API int bpf_object__pin_maps2(struct bpf_object *obj, const char *path,
+				     enum bpf_pin_mode mode);
 LIBBPF_API int bpf_object__pin_maps(struct bpf_object *obj, const char *path);
 LIBBPF_API int bpf_object__unpin_maps(struct bpf_object *obj,
 				      const char *path);
@@ -353,6 +360,7 @@ struct bpf_prog_load_attr {
 	int ifindex;
 	int log_level;
 	int prog_flags;
+	const char *auto_pin_path;
 };
 
 LIBBPF_API int bpf_prog_load_xattr(const struct bpf_prog_load_attr *attr,

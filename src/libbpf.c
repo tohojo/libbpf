@@ -219,6 +219,7 @@ struct bpf_map {
 	size_t sec_offset;
 	int map_ifindex;
 	int inner_map_fd;
+	int pin_reused;
 	struct bpf_map_def def;
 	__u32 btf_key_type_id;
 	__u32 btf_value_type_id;
@@ -3943,8 +3944,10 @@ int bpf_map__unpin(struct bpf_map *map, const char *path)
 	return 0;
 }
 
-int bpf_object__pin_maps(struct bpf_object *obj, const char *path)
+int bpf_object__pin_maps2(struct bpf_object *obj, const char *path,
+			  enum bpf_pin_mode mode)
 {
+	int explicit = (mode == BPF_PIN_MODE_EXPLICIT);
 	struct bpf_map *map;
 	int err;
 
@@ -3963,6 +3966,9 @@ int bpf_object__pin_maps(struct bpf_object *obj, const char *path)
 	bpf_object__for_each_map(map, obj) {
 		char buf[PATH_MAX];
 		int len;
+
+		if ((explicit && !map->def.pinning) || map->pin_reused)
+			continue;
 
 		len = snprintf(buf, PATH_MAX, "%s/%s", path,
 			       bpf_map__name(map));
@@ -3986,6 +3992,9 @@ err_unpin_maps:
 		char buf[PATH_MAX];
 		int len;
 
+		if ((explicit && !map->def.pinning) || map->pin_reused)
+			continue;
+
 		len = snprintf(buf, PATH_MAX, "%s/%s", path,
 			       bpf_map__name(map));
 		if (len < 0)
@@ -3997,6 +4006,11 @@ err_unpin_maps:
 	}
 
 	return err;
+}
+
+int bpf_object__pin_maps(struct bpf_object *obj, const char *path)
+{
+	return bpf_object__pin_maps2(obj, path, BPF_PIN_MODE_ALL);
 }
 
 int bpf_object__unpin_maps(struct bpf_object *obj, const char *path)
@@ -4751,6 +4765,141 @@ int bpf_prog_load(const char *file, enum bpf_prog_type type,
 	return bpf_prog_load_xattr(&attr, pobj, prog_fd);
 }
 
+static int bpf_read_map_info(int fd, struct bpf_map_def *map,
+			     enum bpf_prog_type *type)
+{
+	unsigned int val, owner_type = 0;
+	char file[PATH_MAX], buff[4096];
+	FILE *fp;
+
+	snprintf(file, sizeof(file), "/proc/%d/fdinfo/%d", getpid(), fd);
+	memset(map, 0, sizeof(*map));
+
+	fp = fopen(file, "r");
+	if (!fp) {
+		pr_warning("No procfs support?!\n");
+		return -EIO;
+	}
+
+	while (fgets(buff, sizeof(buff), fp)) {
+		if (sscanf(buff, "map_type:\t%u", &val) == 1)
+			map->type = val;
+		else if (sscanf(buff, "key_size:\t%u", &val) == 1)
+			map->key_size = val;
+		else if (sscanf(buff, "value_size:\t%u", &val) == 1)
+			map->value_size = val;
+		else if (sscanf(buff, "max_entries:\t%u", &val) == 1)
+			map->max_entries = val;
+		else if (sscanf(buff, "map_flags:\t%i", &val) == 1)
+			map->map_flags = val;
+		else if (sscanf(buff, "owner_prog_type:\t%i", &val) == 1)
+			owner_type = val;
+	}
+
+	fclose(fp);
+	if (type)
+		*type  = owner_type;
+
+	return 0;
+}
+
+static void bpf_map_pin_report(const struct bpf_map_def *pin,
+			       const struct bpf_map_def *obj)
+{
+	pr_warning("Map specification differs from pinned file!\n");
+
+	if (obj->type != pin->type)
+		pr_warning(" - Type:         %u (obj) != %u (pin)\n",
+			   obj->type, pin->type);
+	if (obj->key_size != pin->key_size)
+		pr_warning(" - Key size:     %u (obj) != %u (pin)\n",
+			   obj->key_size, pin->key_size);
+	if (obj->value_size != pin->value_size)
+		pr_warning(" - Value size:   %u (obj) != %u (pin)\n",
+			   obj->value_size, pin->value_size);
+	if (obj->max_entries != pin->max_entries)
+		pr_warning(" - Max entries:    %u (obj) != %u (pin)\n",
+			   obj->max_entries, pin->max_entries);
+	if (obj->map_flags != pin->map_flags)
+		pr_warning(" - Flags:        %#x (obj) != %#x (pin)\n",
+			   obj->map_flags, pin->map_flags);
+
+	pr_warning("\n");
+}
+
+
+
+static int bpf_map_selfcheck_pinned(int fd, const struct bpf_map_def *map,
+				    int length, enum bpf_prog_type type)
+{
+	enum bpf_prog_type owner_type = 0;
+	struct bpf_map_def tmp, zero = {};
+	int ret;
+
+	ret = bpf_read_map_info(fd, &tmp, &owner_type);
+	if (ret < 0)
+		return ret;
+
+	/* The decision to reject this is on kernel side eventually, but
+	 * at least give the user a chance to know what's wrong.
+	 */
+	if (owner_type && owner_type != type)
+		pr_warning("Program array map owner types differ: %u (obj) != %u (pin)\n",
+			   type, owner_type);
+
+	if (!memcmp(&tmp, map, length)) {
+		return 0;
+	} else {
+		/* If kernel doesn't have eBPF-related fdinfo, we cannot do much,
+		 * so just accept it. We know we do have an eBPF fd and in this
+		 * case, everything is 0. It is guaranteed that no such map exists
+		 * since map type of 0 is unloadable BPF_MAP_TYPE_UNSPEC.
+		 */
+		if (!memcmp(&tmp, &zero, length))
+			return 0;
+
+		bpf_map_pin_report(&tmp, map);
+		return -EINVAL;
+	}
+}
+
+
+int bpf_probe_pinned(const struct bpf_map *map,
+		     const struct bpf_prog_load_attr *attr)
+{
+	const char *name = bpf_map__name(map);
+	char buf[PATH_MAX];
+	int fd, len, ret;
+
+	if (!attr->auto_pin_path)
+		return -ENOENT;
+
+	len = snprintf(buf, PATH_MAX, "%s/%s", attr->auto_pin_path,
+		       name);
+	if (len < 0)
+		return -EINVAL;
+	else if (len >= PATH_MAX)
+		return -ENAMETOOLONG;
+
+	fd = bpf_obj_get(buf);
+	if (fd <= 0)
+		return fd;
+
+	ret = bpf_map_selfcheck_pinned(fd, &map->def,
+				       offsetof(struct bpf_map_def,
+						map_id),
+				       attr->prog_type);
+	if (ret < 0) {
+		close(fd);
+		pr_warning("Map \'%s\' self-check failed!\n", name);
+		return ret;
+	}
+	if (attr->log_level)
+		pr_debug("Map \'%s\' loaded as pinned!\n", name);
+
+	return fd;
+}
+
 int bpf_prog_load_xattr(const struct bpf_prog_load_attr *attr,
 			struct bpf_object **pobj, int *prog_fd)
 {
@@ -4802,8 +4951,14 @@ int bpf_prog_load_xattr(const struct bpf_prog_load_attr *attr,
 	}
 
 	bpf_object__for_each_map(map, obj) {
+		int fd;
+
 		if (!bpf_map__is_offload_neutral(map))
 			map->map_ifindex = attr->ifindex;
+
+		fd = bpf_probe_pinned(map, attr);
+		if (fd > 0 && !bpf_map__reuse_fd(map, fd))
+			map->pin_reused = 1;
 	}
 
 	if (!first_prog) {
@@ -4817,6 +4972,10 @@ int bpf_prog_load_xattr(const struct bpf_prog_load_attr *attr,
 		bpf_object__close(obj);
 		return -EINVAL;
 	}
+
+	if (attr->auto_pin_path)
+		bpf_object__pin_maps2(obj, attr->auto_pin_path,
+				      BPF_PIN_MODE_EXPLICIT);
 
 	*pobj = obj;
 	*prog_fd = bpf_program__fd(first_prog);
