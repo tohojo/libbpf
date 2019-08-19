@@ -3944,8 +3944,33 @@ int bpf_map__unpin(struct bpf_map *map, const char *path)
 	return 0;
 }
 
-int bpf_object__pin_maps2(struct bpf_object *obj, const char *path,
-			  enum bpf_pin_mode mode)
+int __bpf_map__pin_path(const struct bpf_map *map,
+			const char *path,
+			map_pinning_path_fn fn, void *fn_ctx,
+			char *buf, int buf_len)
+{
+	const char *name = bpf_map__name(map);
+	int len;
+
+	if (fn) {
+		len = fn(fn_ctx, buf, buf_len, name, map->def.pinning);
+		buf[buf_len - 1] = '\0';
+		return len;
+	}
+
+	len = snprintf(buf, PATH_MAX, "%s/%s", path,
+		       name);
+	if (len < 0)
+		return -EINVAL;
+	else if (len >= PATH_MAX)
+		return -ENAMETOOLONG;
+
+	return len;
+}
+
+int __bpf_object__pin_maps(struct bpf_object *obj, enum bpf_pin_mode mode,
+			   const char *path,
+			   map_pinning_path_fn cb, void *cb_ctx)
 {
 	int explicit = (mode == BPF_PIN_MODE_EXPLICIT);
 	struct bpf_map *map;
@@ -3959,9 +3984,11 @@ int bpf_object__pin_maps2(struct bpf_object *obj, const char *path,
 		return -ENOENT;
 	}
 
-	err = make_dir(path);
-	if (err)
-		return err;
+	if (path) {
+		err = make_dir(path);
+		if (err)
+			return err;
+	}
 
 	bpf_object__for_each_map(map, obj) {
 		char buf[PATH_MAX];
@@ -3970,13 +3997,9 @@ int bpf_object__pin_maps2(struct bpf_object *obj, const char *path,
 		if ((explicit && !map->def.pinning) || map->pin_reused)
 			continue;
 
-		len = snprintf(buf, PATH_MAX, "%s/%s", path,
-			       bpf_map__name(map));
+		len = __bpf_map__pin_path(map, path, cb, cb_ctx, buf, PATH_MAX);
 		if (len < 0) {
 			err = -EINVAL;
-			goto err_unpin_maps;
-		} else if (len >= PATH_MAX) {
-			err = -ENAMETOOLONG;
 			goto err_unpin_maps;
 		}
 
@@ -4007,6 +4030,13 @@ err_unpin_maps:
 
 	return err;
 }
+
+int bpf_object__pin_maps2(struct bpf_object *obj, const char *path,
+			  enum bpf_pin_mode mode)
+{
+	return __bpf_object__pin_maps(obj, mode, path, NULL, NULL);
+}
+
 
 int bpf_object__pin_maps(struct bpf_object *obj, const char *path)
 {
@@ -4863,23 +4893,21 @@ static int bpf_map_selfcheck_pinned(int fd, const struct bpf_map_def *map,
 	}
 }
 
-
 int bpf_probe_pinned(const struct bpf_map *map,
 		     const struct bpf_prog_load_attr *attr)
 {
 	const char *name = bpf_map__name(map);
 	char buf[PATH_MAX];
-	int fd, len, ret;
+	int fd, ret;
 
-	if (!attr->auto_pin_path)
+	if (!attr->auto_pin_path && !attr->auto_pin_cb)
 		return -ENOENT;
 
-	len = snprintf(buf, PATH_MAX, "%s/%s", attr->auto_pin_path,
-		       name);
-	if (len < 0)
-		return -EINVAL;
-	else if (len >= PATH_MAX)
-		return -ENAMETOOLONG;
+	ret = __bpf_map__pin_path(map, attr->auto_pin_path,
+				  attr->auto_pin_cb, attr->auto_pin_ctx,
+				  buf, PATH_MAX);
+	if (ret < 0)
+		return ret;
 
 	fd = bpf_obj_get(buf);
 	if (fd <= 0)
@@ -4973,9 +5001,10 @@ int bpf_prog_load_xattr(const struct bpf_prog_load_attr *attr,
 		return -EINVAL;
 	}
 
-	if (attr->auto_pin_path)
-		bpf_object__pin_maps2(obj, attr->auto_pin_path,
-				      BPF_PIN_MODE_EXPLICIT);
+	if (attr->auto_pin_path || attr->auto_pin_cb)
+		__bpf_object__pin_maps(obj, BPF_PIN_MODE_EXPLICIT,
+				       attr->auto_pin_path, attr->auto_pin_cb,
+				       attr->auto_pin_ctx);
 
 	*pobj = obj;
 	*prog_fd = bpf_program__fd(first_prog);

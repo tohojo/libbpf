@@ -72,6 +72,10 @@ enum bpf_pin_mode {
 	BPF_PIN_MODE_EXPLICIT,
 };
 
+struct bpf_map_def;
+typedef int (*map_pinning_path_fn)(void *ctx, char *buf, int buf_len,
+				   const char *name, unsigned int pinning);
+
 LIBBPF_API struct bpf_object *bpf_object__open(const char *path);
 LIBBPF_API struct bpf_object *
 bpf_object__open_xattr(struct bpf_object_open_attr *attr);
@@ -361,6 +365,8 @@ struct bpf_prog_load_attr {
 	int log_level;
 	int prog_flags;
 	const char *auto_pin_path;
+	map_pinning_path_fn auto_pin_cb;
+	void *auto_pin_ctx;
 };
 
 LIBBPF_API int bpf_prog_load_xattr(const struct bpf_prog_load_attr *attr,
