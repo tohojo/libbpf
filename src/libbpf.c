@@ -2191,6 +2191,11 @@ static int bpf_object__create_map(struct bpf_object *obj,
 		create_attr.btf_value_type_id = map->btf_value_type_id;
 	}
 
+	if (def->map_flags & BPF_F_NUMA_NODE) {
+		create_attr.numa_node = def->numa_node;
+		create_attr.map_flags |= BPF_F_NUMA_NODE;
+	}
+
 	*pfd = bpf_create_map_xattr(&create_attr);
 	if (*pfd < 0 && (create_attr.btf_key_type_id ||
 			 create_attr.btf_value_type_id)) {

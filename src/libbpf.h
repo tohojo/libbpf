@@ -304,6 +304,7 @@ struct bpf_map_def {
 	unsigned int pinning;
 	unsigned int inner_id;
 	unsigned int inner_idx;
+	unsigned int numa_node;
 };
 
 /*
